@@ -39,10 +39,9 @@ class ExpertFusionMixin:
     def setup_expert_fusion(self) -> None:
         """Fuse the action expert's q/k/v and gate/up projections for fewer GEMM launches.
 
-        In-place: each fused ``FusedLinear`` is built from the projections it replaces,
-        which are then deleted and the module's fuse flag flipped. Idempotent.
-        Expects ``setup_rollout`` to have patched the backbone first (the
-        fuse-aware forwards live on the patched classes).
+        In-place and idempotent: each ``FusedLinear`` replaces the projections it
+        was built from, and the module's fuse flag is flipped. Requires the
+        backbone patched by ``setup_rollout`` (the fuse-aware forwards).
         """
         for layer in self.expert.layers:
             attn = layer.self_attn

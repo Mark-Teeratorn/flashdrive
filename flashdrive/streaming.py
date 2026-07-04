@@ -117,11 +117,8 @@ def create_streaming_attention_mask_sdpa(
         region_length = region.q_end - region.q_start
         q_indices = torch.arange(region_length, device=device).unsqueeze(1)
         kv_indices = torch.arange(region_length, device=device).unsqueeze(0)
-        causal_mask = kv_indices <= q_indices
         rows[:, :, :, region.kv_start : region.kv_start + region_length] = torch.where(
-            causal_mask.unsqueeze(0).unsqueeze(0),
-            torch.tensor(0.0, dtype=dtype, device=device),
-            torch.tensor(min_val, dtype=dtype, device=device),
+            kv_indices <= q_indices, 0.0, min_val
         )
 
     if valid_length < kv_length:
@@ -152,7 +149,11 @@ def convert_to_streaming_window(
     vs_positions = (input_ids == vision_start_token_id).nonzero(as_tuple=True)[0].tolist()
     ve_positions = (input_ids == vision_end_token_id).nonzero(as_tuple=True)[0].tolist()
     num_frames = num_views * num_frames_per_view
-    assert len(vs_positions) == num_frames and len(ve_positions) == num_frames
+    if len(vs_positions) != num_frames or len(ve_positions) != num_frames:
+        raise ValueError(
+            f"Expected {num_frames} vision blocks, got {len(vs_positions)} starts "
+            f"and {len(ve_positions)} ends."
+        )
 
     # Last frame index per view (e.g. 3, 7, 11, 15 for 4 views x 4 frames).
     keep_indices = [
@@ -221,7 +222,9 @@ class StreamingMixin:
         vision_starts = torch.where(input_ids == self.vision_start_token_id)[1]
         vision_ends = torch.where(input_ids == self.vision_end_token_id)[1]
 
-        for frame_idx, (vision_start, vision_end) in enumerate(zip(vision_starts, vision_ends)):
+        for frame_idx, (vision_start, vision_end) in enumerate(
+            zip(vision_starts, vision_ends, strict=True)
+        ):
             view_idx = frame_idx // self._num_frames_per_view
             frame_ranges[view_idx].append((vision_start.item(), vision_end.item() + 1))
 
@@ -231,9 +234,8 @@ class StreamingMixin:
     def _shift_streaming_kv_cache(self) -> None:
         """Shift each view's KV cache: move frame blocks 1..N-1 into slots 0..N-2.
 
-        One gather + one scatter per tensor per layer (via the index tensors
-        built at first prefill) instead of one small copy per frame block —
-        the shift runs every window, so launch count matters.
+        One gather + scatter per tensor per layer (index tensors built at first
+        prefill); the shift runs every window, so launch count matters.
         """
         src, dst = self._shift_src_index, self._shift_dst_index
         for layer in self._past_key_values.layers:
@@ -295,7 +297,7 @@ class StreamingMixin:
         src_index, dst_index = [], []
         for view_frames in self._frame_ranges:
             for (dst_start, dst_end), (src_start, src_end) in zip(
-                view_frames[:-1], view_frames[1:]
+                view_frames[:-1], view_frames[1:], strict=True
             ):
                 dst_index.append(torch.arange(dst_start, dst_end))
                 src_index.append(torch.arange(src_start, src_end))

@@ -4,7 +4,7 @@ Drop-in patched vision/text modules applied by ``patch_backbone`` (streaming
 RoPE + attention mask, fuse-aware projections, DFlash hidden-state capture,
 fullgraph-compilable), and the ``StaticCache`` shared by every FlashDrive
 rollout. A torch 2.9 Conv3D -> Linear patch-embed fix is applied globally at
-import time (see the bottom of the module).
+import time (see the bottom of the module); the original-model path needs it too.
 """
 
 from typing import Any
@@ -30,11 +30,9 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 class StaticLayer(cache_utils.StaticLayer):
     """Upstream ``StaticLayer`` with a pre-sized batch and partial-batch updates.
 
-    Everything cudagraph-related (allocation, ``mark_static_address``, mask sizes,
-    sequence-length accounting) is inherited. FlashDrive adds what its rollout
-    needs: the cache is allocated for the full multi-sample decode batch even when
-    the batch-1 prefill initializes it, and ``expand_batch`` fans the prompt KV out
-    to every sample.
+    The cache is allocated for the full multi-sample decode batch even when the
+    batch-1 prefill initializes it, and ``expand_batch`` fans the prompt KV out to
+    every sample; everything else is inherited.
     """
 
     def __init__(self, max_cache_len: int, max_batch_size: int = 1) -> None:
@@ -75,6 +73,8 @@ class StaticLayer(cache_utils.StaticLayer):
         Call this after prefill (batch=1) and before multi-sample decode,
         so all samples start with the same prompt KV.
         """
+        # max_batch_size is the allocated batch, set by upstream lazy_initialization
+        # from the expanded key_states (>= self._max_batch_size).
         if self.is_initialized and self.max_batch_size > 1:
             self.keys[1:].copy_(self.keys[:1].expand(self.max_batch_size - 1, -1, -1, -1))
             self.values[1:].copy_(self.values[:1].expand(self.max_batch_size - 1, -1, -1, -1))
@@ -106,9 +106,8 @@ _PATCHED_CLASSES: dict[type, type] = {}
 def _drop_in(cls: type) -> type:
     """Register a patched class as the drop-in replacement for its direct base.
 
-    Keyed by the exact class (both Alpamayo backbones instantiate transformers'
-    own Qwen3-VL modules): no name-based false matches, and idempotent since a
-    patched module's type is never a key.
+    Keyed by the exact base class, so patching is precise and idempotent (a
+    patched module's type is never a key).
     """
     _PATCHED_CLASSES[cls.__base__] = cls
     return cls
@@ -144,19 +143,19 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
         **kwargs: Any,
     ) -> torch.Tensor:
         seq_len = hidden_states.shape[0]
-
-        if not hasattr(self, "_num_chunks"):
-            self._num_chunks = cu_seqlens.numel() - 1
+        # Frames are equal-sized, so the varlen layout folds into equal chunks
+        # (a batched sdpa instead of flash-attn's varlen kernel).
+        num_chunks = cu_seqlens.numel() - 1
+        chunk_size = seq_len // num_chunks
 
         qkv = self.qkv(hidden_states).reshape(seq_len, 3, self.num_heads, -1)
         query, key, value = qkv.permute(1, 0, 2, 3).unbind(0)
 
         query, key = apply_rotary_pos_emb_vision(query, key, *position_embeddings)
 
-        chunk_size = seq_len // self._num_chunks
-        query = query.reshape(self._num_chunks, chunk_size, self.num_heads, -1).transpose(1, 2)
-        key = key.reshape(self._num_chunks, chunk_size, self.num_heads, -1).transpose(1, 2)
-        value = value.reshape(self._num_chunks, chunk_size, self.num_heads, -1).transpose(1, 2)
+        query = query.reshape(num_chunks, chunk_size, self.num_heads, -1).transpose(1, 2)
+        key = key.reshape(num_chunks, chunk_size, self.num_heads, -1).transpose(1, 2)
+        value = value.reshape(num_chunks, chunk_size, self.num_heads, -1).transpose(1, 2)
 
         output = F.scaled_dot_product_attention(query, key, value, scale=self.scaling)
         output = self.proj(output.transpose(1, 2).reshape(seq_len, -1))
@@ -171,9 +170,6 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         for attr in ("_cached_pos_embeds", "_cached_position_embeddings", "_cached_cu_seqlens"):
             if hasattr(self, attr):
                 delattr(self, attr)
-        for block in self.blocks:
-            if hasattr(block.attn, "_num_chunks"):
-                del block.attn._num_chunks
 
     def _init_shape_caches(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> None:
         seq_len = hidden_states.size(0)
@@ -233,11 +229,12 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
 
     def forward(
         self,
-        hidden_states: torch.Tensor | None = None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         past_key_values: cache_utils.Cache | None = None,
-        cache_position: torch.Tensor | None = None,
+        *,
+        cache_position: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -300,18 +297,19 @@ class Qwen3VLTextMLP(qwen3vl.Qwen3VLTextMLP):
 
 @_drop_in
 class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
+    # Class default; set_capture_layer_ids sets the instance attribute. The action
+    # expert's text model keeps the default (it never captures).
+    _capture_layer_ids: frozenset[int] = frozenset()
+
     def reset_shape_caches(self) -> None:
         """Drop the shape-specific forward caches (call when the frame count changes)."""
         if hasattr(self, "_cached_deepstack_indices"):
             del self._cached_deepstack_indices
 
     def set_capture_layer_ids(self, layer_ids: list[int]) -> None:
-        """Configure which layer hidden states to return in ``hidden_states``.
-
-        torch.compile-friendly: the set is a constant determined before
-        compilation, so ``layer_idx in set`` traces as static control flow.
-        """
-        self._capture_layer_ids = set(layer_ids)
+        """Configure which layers' hidden states to return in ``hidden_states``
+        (fixed before compilation, so the capture check traces as static control flow)."""
+        self._capture_layer_ids = frozenset(layer_ids)
 
     def forward(
         self,
@@ -331,6 +329,7 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        # The mrope table is (3, batch, seq); downstream wants the (batch, seq) temporal row.
         position_ids = position_ids[0]
 
         if inputs_embeds.shape[1] > 1:  # prefill, attention handles decode by default
@@ -351,7 +350,6 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
 
         hidden_states = inputs_embeds
         captured: list[torch.Tensor] = []
-        capture_ids = getattr(self, "_capture_layer_ids", ())
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states,
@@ -362,7 +360,7 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
                 position_embeddings=position_embeddings,
             )
             # Capture specific layers for DFlash draft context (compile-friendly)
-            if layer_idx in capture_ids:
+            if layer_idx in self._capture_layer_ids:
                 captured.append(hidden_states)
             if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
                 flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
@@ -380,11 +378,8 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
 def patch_backbone(model: nn.Module) -> None:
     """Swap the Qwen3-VL modules for their FlashDrive replacements.
 
-    The patched forwards carry the streaming attention-mask / RoPE path, the
-    fuse-aware projections, and the DFlash hidden-state capture, and are
-    fullgraph-compilable. Every ``@_drop_in`` class is a drop-in subclass (same
-    parameters and buffers), so patching is a pure in-place ``__class__``
-    reassignment: no weight copies, no device moves.
+    Every ``@_drop_in`` class has the same parameters and buffers as its base, so
+    patching is a pure ``__class__`` reassignment: no weight copies, no device moves.
     """
     for module in model.modules():
         patched = _PATCHED_CLASSES.get(type(module))
@@ -392,7 +387,7 @@ def patch_backbone(model: nn.Module) -> None:
             module.__class__ = patched
 
 
-# Applied at import time (the stock baseline path needs it too): the Conv3d patch_embed
+# Applied at import time (the original-model path needs it too): the Conv3d patch_embed
 # is extremely slow on Blackwell with torch 2.9, so swap in the Linear version globally.
 # Still needed as of transformers 4.57 (upstream remains Conv3d-based).
 qwen3vl.Qwen3VLVisionPatchEmbed = Qwen3VLVisionPatchEmbed

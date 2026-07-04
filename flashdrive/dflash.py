@@ -1,7 +1,7 @@
 """DFlash speculative-decoding patch for FlashDrive.
 
 `DFlashMixin` isolates draft-model speculative decoding: draft model setup, the
-compiled prefill/block-step/text-forward primitives, the speculative decode loop,
+compiled prefill/block-step/traj-forward primitives, the speculative decode loop,
 and the `_dflash_generate` phase that `sample_trajectories_streaming`
 dispatches to. This module also defines the small Qwen3-based draft network
 (`DFlashDraftModel`). Streaming-specific inputs (position table, attention
@@ -9,7 +9,6 @@ mask) are passed in by the driver.
 """
 
 import logging
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -45,11 +44,9 @@ def sample_tokens(
 ) -> torch.Tensor:
     """Decode tokens with the trajectory-token span masked to -inf (in place).
 
-    Greedy at ``temperature=0``; otherwise nucleus sampling from the
-    temperature-scaled distribution, matching the stock baseline's decoding
-    (temperature scale, then top-p filter — equal to transformers'
-    ``TopPLogitsWarper`` — then sample). ``logits`` is mutated by the masking;
-    callers pass freshly-computed graph outputs.
+    Greedy at ``temperature=0``; otherwise temperature-scaled nucleus sampling,
+    matching the original model's decoding (transformers' ``TopPLogitsWarper``).
+    ``logits`` is mutated by the masking; callers pass fresh graph outputs.
     """
     offset, size = traj_mask
     logits[:, :, offset : offset + size] = float("-inf")
@@ -252,7 +249,7 @@ class DFlashMixin:
         """
         param = next(self.parameters())
 
-        logger.info(f"Loading DFlash draft model from {checkpoint_path}")
+        logger.info("Loading DFlash draft model from %s", checkpoint_path)
         draft_model = (
             DFlashDraftModel.from_pretrained(checkpoint_path, dtype=param.dtype)
             .to(param.device)
@@ -263,10 +260,11 @@ class DFlashMixin:
             raise ValueError(f"{checkpoint_path!r} config defines no mask_token_id.")
 
         # The mask token sits one past the target's vocabulary; grow the embedding table.
+        # No mean-resizing: the new embedding row is overwritten from the checkpoint
+        # below, and mask tokens are filtered from the decoded output regardless.
         vocab_size = self.vlm.get_input_embeddings().weight.shape[0]
         if mask_token_id == vocab_size:
-            logger.info(f"[DFlash] Resizing embeddings from {vocab_size} to {vocab_size + 1}")
-            self.vlm.resize_token_embeddings(vocab_size + 1)
+            self.vlm.resize_token_embeddings(vocab_size + 1, mean_resizing=False)
         elif mask_token_id > vocab_size:
             raise ValueError(
                 f"mask_token_id={mask_token_id} is out of vocabulary range ({vocab_size})."
@@ -279,7 +277,7 @@ class DFlashMixin:
             from huggingface_hub import hf_hub_download
 
             mask_emb_file = Path(hf_hub_download(checkpoint_path, "mask_embedding.pt"))
-        logger.info(f"[DFlash] Loading mask embedding from {mask_emb_file}")
+        logger.debug("Loading mask embedding from %s", mask_emb_file)
         mask_emb = torch.load(mask_emb_file, map_location=param.device, weights_only=True)
         embeddings = self.vlm.get_input_embeddings()
         with torch.no_grad():
@@ -303,10 +301,11 @@ class DFlashMixin:
         self.vlm.model.language_model.set_capture_layer_ids(draft_model.target_layer_ids)
 
         logger.info(
-            f"DFlash configured: block_size={self.dflash_block_size}, "
-            f"context_len={self._dflash_context_len}, "
-            f"target_layers={draft_model.target_layer_ids}, "
-            f"mask_token_id={self._dflash_mask_token_id}"
+            "DFlash configured: block_size=%d, context_len=%s, target_layers=%s, mask_token_id=%d",
+            self.dflash_block_size,
+            self._dflash_context_len,
+            draft_model.target_layer_ids,
+            self._dflash_mask_token_id,
         )
 
     # =========================== Compiled primitives ===========================
@@ -320,23 +319,20 @@ class DFlashMixin:
         deepstack_image_embeds: list[torch.Tensor],
         streaming_attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        def make_fn(b: dict[str, Any]) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
-            def dflash_prefill_fn() -> tuple[torch.Tensor, torch.Tensor]:
-                output = self.vlm.model.language_model(
-                    inputs_embeds=b["inputs_embeds"],
-                    position_ids=b["position_ids"],
-                    past_key_values=self._past_key_values,
-                    cache_position=b["cache_position"],
-                    visual_pos_masks=b["visual_pos_masks"],
-                    deepstack_visual_embeds=b["deepstack_embeds"],
-                    streaming_attention_mask=b["streaming_mask"],
-                    use_cache=True,
-                )
-                logits = self.vlm.lm_head(output.last_hidden_state[:, -1])
-                context = torch.cat(output.hidden_states, dim=-1)[:, -self._dflash_context_len :, :]
-                return logits, context
-
-            return dflash_prefill_fn
+        def dflash_prefill_fn(b: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+            output = self.vlm.model.language_model(
+                inputs_embeds=b["inputs_embeds"],
+                position_ids=b["position_ids"],
+                past_key_values=self._past_key_values,
+                cache_position=b["cache_position"],
+                visual_pos_masks=b["visual_pos_masks"],
+                deepstack_visual_embeds=b["deepstack_embeds"],
+                streaming_attention_mask=b["streaming_mask"],
+                use_cache=True,
+            )
+            logits = self.vlm.lm_head(output.last_hidden_state[:, -1])
+            context = torch.cat(output.hidden_states, dim=-1)[:, -self._dflash_context_len :, :]
+            return logits, context
 
         return self._compiled_step(
             "dflash_prefill",
@@ -348,45 +344,34 @@ class DFlashMixin:
                 "deepstack_embeds": deepstack_image_embeds,
                 "streaming_mask": streaming_attention_mask,
             },
-            make_fn,
+            dflash_prefill_fn,
         )
 
-    def _dflash_text_forward(
+    def _dflash_traj_forward(
         self,
-        key: str,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         cache_position: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Target text-model step over ``input_ids``: (logits, draft context).
+    ) -> None:
+        """Run the 1-token trajectory-start step through the target, for its KV only."""
 
-        One compiled shape per ``key``: the block-sized verify step and the 1-token
-        trajectory-start step both run through here.
-        """
+        def traj_forward_fn(b: dict[str, Any]) -> torch.Tensor:
+            return self.vlm.model.language_model(
+                input_ids=b["input_ids"],
+                position_ids=b["position_ids"],
+                past_key_values=self._past_key_values,
+                cache_position=b["cache_position"],
+                use_cache=True,
+            ).last_hidden_state
 
-        def make_fn(b: dict[str, Any]) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
-            def text_forward_fn() -> tuple[torch.Tensor, torch.Tensor]:
-                output = self.vlm.model.language_model(
-                    input_ids=b["input_ids"],
-                    position_ids=b["position_ids"],
-                    past_key_values=self._past_key_values,
-                    cache_position=b["cache_position"],
-                    use_cache=True,
-                )
-                logits = self.vlm.lm_head(output.last_hidden_state)
-                context = torch.cat(output.hidden_states, dim=-1)
-                return logits, context
-
-            return text_forward_fn
-
-        return self._compiled_step(
-            key,
+        self._compiled_step(
+            "dflash_traj_forward",
             {
                 "input_ids": input_ids,
                 "position_ids": position_ids,
                 "cache_position": cache_position,
             },
-            make_fn,
+            traj_forward_fn,
         )
 
     def _dflash_block_step(
@@ -398,87 +383,76 @@ class DFlashMixin:
         temperature: float,
         top_p: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """One speculative round in a single graph: draft, propose, verify, sample,
-        decide.
+        """One speculative round in a single graph: draft, verify, sample, decide.
 
-        Returns ``(block, posterior, context, stats)``: the verified token block
-        (previous token + greedy draft proposals), the posterior samples, the
-        draft context hidden states, and ``stats`` packing ``[acceptance_length,
-        first_stop_position_or_-1, period_hit]`` — so the decode loop pays one
-        graph replay and one device sync per round. ``temperature`` / ``top_p``
-        are bound into the graph on first use (fixed per stream, like every
-        compiled-shape parameter).
+        Returns ``(block, posterior, context, stats)`` — the verified token block,
+        the posterior samples, the draft context hidden states, and ``stats``
+        packing ``[acceptance_length, first_stop_position_or_-1, period_hit]`` —
+        so the decode loop pays one graph replay and one device sync per round.
+        ``temperature`` / ``top_p`` are bound into the graph on first use.
 
-        The draft proposes greedily: emitted tokens are always the (sampled)
-        posterior's — accepted positions are where draft == posterior and the
-        bonus token is the posterior — so the draft's decoding only affects the
-        acceptance rate, and greedy maximises it.
+        The draft proposes greedily: emitted tokens are always the posterior's,
+        so the draft's decoding only affects the acceptance rate, and greedy
+        maximises it.
         """
 
-        def make_fn(
+        def block_step_fn(
             b: dict[str, Any],
-        ) -> Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-            def block_step_fn() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-                # Draft + greedy proposals.
-                noise = self.vlm.model.language_model.embed_tokens(b["block_ids"])
-                draft_positions = (
-                    torch.arange(
-                        self._dflash_context_len + self.dflash_block_size, device=noise.device
-                    )
-                    .unsqueeze(0)
-                    .expand(b["block_ids"].shape[0], -1)
-                )
-                hidden = self._draft_model(
-                    target_hidden=b["target_hidden"],
-                    noise_embedding=noise,
-                    position_ids=draft_positions,
-                    is_causal=False,
-                )
-                draft_logits = self.vlm.lm_head(hidden[:, 1:, :])
-                proposed = sample_tokens(draft_logits, self._dflash_traj_mask, 0.0)
-                # After a proposed <cot_end>, propose the trajectory-start token: if
-                # that stop is accepted, this verify has already written the traj
-                # token's KV (right token, position, and accepted-prefix context),
-                # so the separate one-token traj forward can be skipped.
-                follows_stop = nn.functional.pad(
-                    proposed[:, :-1] == self._dflash_stop_token_id, (1, 0)
-                )
-                proposed = torch.where(
-                    follows_stop, proposed.new_tensor(self.traj_start_token_id), proposed
-                )
-                block = torch.cat([b["block_ids"][:, :1], proposed], dim=1)
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            # Draft + greedy proposals.
+            noise = self.vlm.model.language_model.embed_tokens(b["block_ids"])
+            draft_positions = (
+                torch.arange(self._dflash_context_len + self.dflash_block_size, device=noise.device)
+                .unsqueeze(0)
+                .expand(b["block_ids"].shape[0], -1)
+            )
+            hidden = self._draft_model(
+                target_hidden=b["target_hidden"],
+                noise_embedding=noise,
+                position_ids=draft_positions,
+                is_causal=False,
+            )
+            draft_logits = self.vlm.lm_head(hidden[:, 1:, :])
+            proposed = sample_tokens(draft_logits, self._dflash_traj_mask, 0.0)
+            # After a proposed <cot_end>, propose the trajectory-start token: if
+            # that stop is accepted, this verify has already written the traj
+            # token's KV (right token, position, and accepted-prefix context),
+            # so the separate one-token traj forward can be skipped.
+            follows_stop = nn.functional.pad(proposed[:, :-1] == self._dflash_stop_token_id, (1, 0))
+            proposed = torch.where(
+                follows_stop, proposed.new_tensor(self.traj_start_token_id), proposed
+            )
+            block = torch.cat([b["block_ids"][:, :1], proposed], dim=1)
 
-                # Verify through the target (writes KV at cache_position).
-                output = self.vlm.model.language_model(
-                    input_ids=block,
-                    position_ids=b["position_ids"],
-                    past_key_values=self._past_key_values,
-                    cache_position=b["cache_position"],
-                    use_cache=True,
-                )
-                verify_logits = self.vlm.lm_head(output.last_hidden_state)
-                context = torch.cat(output.hidden_states, dim=-1)
-                posterior = sample_tokens(verify_logits, self._dflash_traj_mask, temperature, top_p)
+            # Verify through the target (writes KV at cache_position).
+            output = self.vlm.model.language_model(
+                input_ids=block,
+                position_ids=b["position_ids"],
+                past_key_values=self._past_key_values,
+                cache_position=b["cache_position"],
+                use_cache=True,
+            )
+            verify_logits = self.vlm.lm_head(output.last_hidden_state)
+            context = torch.cat(output.hidden_states, dim=-1)
+            posterior = sample_tokens(verify_logits, self._dflash_traj_mask, temperature, top_p)
 
-                # Round decisions. The emitted tokens are block[0..acceptance] plus
-                # the bonus token at slot acceptance + 1. gather/scatter keep the
-                # data-dependent index as a tensor — plain indexing would read it
-                # to a Python scalar, a fullgraph break.
-                matches = block[:, 1:] == posterior[:, :-1]
-                acceptance = matches.cumprod(dim=1).sum(dim=1)[0]
-                slot = acceptance.unsqueeze(0)
-                bonus = posterior[0].gather(0, slot)
-                emission = torch.cat([block[0], bonus]).scatter(0, slot + 1, bonus)
-                slots = torch.arange(emission.shape[0], device=emission.device)
-                stop_hits = (emission == self._dflash_stop_token_id) & (slots <= acceptance + 1)
-                first_stop = torch.where(
-                    stop_hits.any(), stop_hits.int().argmax(), acceptance.new_tensor(-1)
-                )
-                period_hit = (bonus[0] == self._dflash_period_token_id).long()
-                stats = torch.stack([acceptance, first_stop, period_hit])
-                return block, posterior, context, stats
-
-            return block_step_fn
+            # Round decisions. The emitted tokens are block[0..acceptance] plus
+            # the bonus token at slot acceptance + 1. gather/scatter keep the
+            # data-dependent index as a tensor — plain indexing would read it
+            # to a Python scalar, a fullgraph break.
+            matches = block[:, 1:] == posterior[:, :-1]
+            acceptance = matches.cumprod(dim=1).sum(dim=1)[0]
+            slot = acceptance.unsqueeze(0)
+            bonus = posterior[0].gather(0, slot)
+            emission = torch.cat([block[0], bonus]).scatter(0, slot + 1, bonus)
+            slots = torch.arange(emission.shape[0], device=emission.device)
+            stop_hits = (emission == self._dflash_stop_token_id) & (slots <= acceptance + 1)
+            first_stop = torch.where(
+                stop_hits.any(), stop_hits.int().argmax(), acceptance.new_tensor(-1)
+            )
+            period_hit = (bonus[0] == self._dflash_period_token_id).long()
+            stats = torch.stack([acceptance, first_stop, period_hit])
+            return block, posterior, context, stats
 
         return self._compiled_step(
             "dflash_block_step",
@@ -488,7 +462,7 @@ class DFlashMixin:
                 "position_ids": position_ids,
                 "cache_position": cache_position,
             },
-            make_fn,
+            block_step_fn,
         )
 
     # =========================== Speculative decode loop ===========================
@@ -547,10 +521,8 @@ class DFlashMixin:
                     output_ids[:, start + stop_position + 1 :] = self._dflash_mask_token_id
             elif period_flag:
                 stop_position = acceptance_length + 1
-                # The period ends the CoT without an explicit <cot_end>; write one so
-                # the emitted sequence matches a natural stop. Without it, the CoC
-                # extraction (which requires a complete <cot_start>..<cot_end> span)
-                # returns an empty string even though the reasoning was generated.
+                # A trailing period ends the CoT without an explicit <cot_end>;
+                # write one so the CoC extraction sees a complete span.
                 output_ids[:, start + acceptance_length + 2] = stop_token_id
 
             start += tokens_to_advance
@@ -567,22 +539,10 @@ class DFlashMixin:
             current_seq_len += acceptance_length + 1
 
             # Slide the draft's context window over the newly accepted hidden states
-            # (cloned to detach from the verify graph's output buffer).
-            n_accepted = acceptance_length + 1
-            accepted_hidden = verify_context[:, :n_accepted, :].clone()
-            if n_accepted > context_len:
-                target_hidden = accepted_hidden[:, -context_len:, :]
-            else:
-                target_hidden = torch.cat(
-                    [
-                        target_hidden[:, n_accepted:, :],
-                        accepted_hidden,
-                    ],
-                    dim=1,
-                )
-            assert target_hidden.shape[1] == context_len, (
-                "Target hidden state should have context_len tokens."
-            )
+            # (the cat copies them out of the verify graph's reusable output buffer).
+            target_hidden = torch.cat(
+                [target_hidden, verify_context[:, : acceptance_length + 1]], dim=1
+            )[:, -context_len:]
 
         output_ids = output_ids[:, :max_length]
         mask = output_ids[0] != self._dflash_mask_token_id
@@ -658,11 +618,9 @@ class DFlashMixin:
         traj_start_token = torch.tensor([[self.traj_start_token_id]], device=device)
         if not traj_cached:
             # Feed the trajectory-start token through the target so its KV is cached
-            # before the action expert runs (logits/context are irrelevant here).
+            # before the action expert runs.
             traj_cache_position = torch.tensor([current_seq_len], device=device, dtype=torch.long)
-            self._dflash_text_forward(
-                "dflash_traj_forward", traj_start_token, position_ids, traj_cache_position
-            )
+            self._dflash_traj_forward(traj_start_token, position_ids, traj_cache_position)
 
         generated_tokens = dflash_output_ids[:, num_input_tokens:]
         return torch.cat([input_ids, generated_tokens, traj_start_token], dim=-1)

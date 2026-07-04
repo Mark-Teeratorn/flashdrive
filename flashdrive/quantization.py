@@ -32,7 +32,8 @@ class Rotation(nn.Module):
 
     def __init__(self, dim: int) -> None:
         super().__init__()
-        assert dim % 128 == 0
+        if dim % 128 != 0:
+            raise ValueError(f"Rotation dim must be a multiple of 128, got {dim}.")
 
         theta = torch.zeros(8, dim // 2, dtype=torch.float16)
         pairs = torch.arange(128, dtype=torch.int).repeat(dim // 128)
@@ -85,14 +86,17 @@ class MarlinW4A8Linear(nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        """Override to allow loading Marlin buffers whose shapes differ from
-        the empty(0) placeholders created in __init__."""
+        """Load Marlin buffers whose shapes differ from the ``empty(0)`` placeholders.
+
+        The checkpoint tensors replace the placeholders outright: each is taken out
+        of both dicts so ``super()`` never shape-checks it, then reattached after.
+        """
         handled = {}
         for name in list(self._buffers.keys()):
             key = prefix + name
             if key in state_dict:
-                self._buffers[name] = state_dict.pop(key)
-                handled[name] = self._buffers.pop(name)
+                handled[name] = state_dict.pop(key)
+                del self._buffers[name]
             elif strict:
                 missing_keys.append(key)
         super()._load_from_state_dict(
@@ -108,8 +112,7 @@ class MarlinW4A8Linear(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Lazy (like the vllm import in __init__): resolves from sys.modules per
-        # call in eager mode, and is baked into the graph under torch.compile.
+        # Lazy vllm import: cached in sys.modules eagerly, baked into the compiled graph.
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
             apply_awq_marlin_linear,
         )
@@ -143,9 +146,7 @@ class RotateLinearW4A8(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.rotation(x)
-        x = self.qlinear(x)
-        return x
+        return self.qlinear(self.rotation(x))
 
 
 class BF16RotateLinearWrapper(nn.Module):
@@ -202,16 +203,13 @@ class ParoQuantMixin:
             state_dict.update(load_file(str(shard), device="cpu"))
 
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        if missing:
-            quant_missing = [k for k in missing if "qlinear" in k or "rotation" in k]
-            if quant_missing:
-                logger.warning(
-                    f"Missing quantization keys ({len(quant_missing)}): {quant_missing[:5]}"
-                )
-            else:
-                logger.info(f"Missing keys ({len(missing)}, all non-quant — OK)")
+        quant_missing = [k for k in missing if "qlinear" in k or "rotation" in k]
+        if quant_missing:
+            logger.warning(
+                "Missing %d quantization keys: %s", len(quant_missing), quant_missing[:5]
+            )
         if unexpected:
-            logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+            logger.warning("Unexpected %d keys: %s", len(unexpected), unexpected[:5])
         del state_dict
 
         # The surgery builds its modules on CPU and the checkpoint loads CPU tensors;

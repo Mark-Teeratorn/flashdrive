@@ -8,7 +8,6 @@ prefill, decode, action — and are pinned to them.
 """
 
 import logging
-from collections.abc import Callable
 from typing import Any
 
 import einops
@@ -36,7 +35,7 @@ _RolloutOutput = (
 class FlashDriveBaseMixin:
     """Feature-agnostic FlashDrive machinery shared by all rollouts."""
 
-    def setup_rollout(self, *, force_sdpa: bool) -> None:
+    def setup_rollout(self) -> None:
         """Patch the backbone and initialize the rollout's shared state.
 
         Must run before the other setups: the fuse-aware forwards and the DFlash
@@ -52,8 +51,6 @@ class FlashDriveBaseMixin:
         self.vision_end_token_id = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
 
         patch_backbone(self)
-        if force_sdpa:  # see _BackboneTraits.force_sdpa for the why
-            self.vlm.model.language_model.config._attn_implementation = "sdpa"
 
     # =========================== Properties ===========================
 
@@ -70,15 +67,13 @@ class FlashDriveBaseMixin:
 
         if not has_traj_start.all():
             missing = (~has_traj_start).nonzero(as_tuple=True)[0].tolist()
-            logger.warning(f"No <traj_future_start> token found in sequences: {missing}")
+            logger.warning("No <traj_future_start> token found in sequences: %s", missing)
 
         return torch.where(
             has_traj_start,
             traj_start_mask.int().argmax(dim=1),
             output_ids.shape[1] - 1,
         )
-
-    # =========================== Compiled primitives ===========================
 
     def _embed_tokens_with_images(
         self, input_ids: torch.Tensor, image_embeds: torch.Tensor
@@ -95,17 +90,16 @@ class FlashDriveBaseMixin:
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
         return inputs_embeds, image_mask
 
+    # =========================== Compiled primitives ===========================
+
     def _encode(
         self,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        def make_fn(b: dict[str, Any]) -> Callable[[], tuple[torch.Tensor, list[torch.Tensor]]]:
-            def encode_fn() -> tuple[torch.Tensor, list[torch.Tensor]]:
-                pixels = b["pixel_values"].type(self.vlm.model.visual.dtype)
-                return self.vlm.model.visual(pixels, grid_thw=b["image_grid_thw"])
-
-            return encode_fn
+        def encode_fn(b: dict[str, Any]) -> tuple[torch.Tensor, list[torch.Tensor]]:
+            pixels = b["pixel_values"].type(self.vlm.model.visual.dtype)
+            return self.vlm.model.visual(pixels, grid_thw=b["image_grid_thw"])
 
         return self._compiled_step(
             "encode",
@@ -113,7 +107,7 @@ class FlashDriveBaseMixin:
                 "pixel_values": pixel_values,
                 "image_grid_thw": image_grid_thw,
             },
-            make_fn,
+            encode_fn,
         )
 
     def _action(
@@ -137,12 +131,12 @@ class FlashDriveBaseMixin:
             )
         action_noise = self._action_noise
 
-        def make_fn(b: dict[str, Any]) -> Callable[[], torch.Tensor]:
-            expert_kwargs = {"is_causal": False} if self.config.expert_non_causal_attention else {}
-            action_dims = self.action_space.get_action_space_dims()
-            sample_kwargs = dict(diffusion_kwargs or {})
-            cached_euler = sample_kwargs.get("int_method") == "euler_with_cache"
+        expert_kwargs = {"is_causal": False} if self.config.expert_non_causal_attention else {}
+        action_dims = self.action_space.get_action_space_dims()
+        sample_kwargs = dict(diffusion_kwargs or {})
+        cached_euler = sample_kwargs.get("int_method") == "euler_with_cache"
 
+        def action_fn(b: dict[str, Any]) -> torch.Tensor:
             def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
                 action_embeds = self.action_in_proj(x, t)
                 if action_embeds.dim() == 2:
@@ -159,28 +153,26 @@ class FlashDriveBaseMixin:
                 ).last_hidden_state[:, -num_action_tokens:]
                 return self.action_out_proj(hidden).view(-1, *action_dims)
 
-            def action_fn() -> torch.Tensor:
-                if cached_euler:
-                    return euler_with_cache(
-                        self.diffusion,
-                        noise=action_noise,
-                        batch_size=total_samples,
-                        step_fn=step_fn,
-                        device=device,
-                        cache_steps=sample_kwargs["cache_steps"],
-                        inference_step=sample_kwargs.get("inference_step")
-                        or self.diffusion.num_inference_steps,
-                    )
-                return self.diffusion.sample(
+            if cached_euler:
+                return euler_with_cache(
+                    self.diffusion,
                     noise=action_noise,
                     batch_size=total_samples,
                     step_fn=step_fn,
                     device=device,
-                    return_all_steps=False,
-                    **sample_kwargs,
+                    cache_steps=sample_kwargs["cache_steps"],
+                    inference_step=sample_kwargs.get(
+                        "inference_step", self.diffusion.num_inference_steps
+                    ),
                 )
-
-            return action_fn
+            return self.diffusion.sample(
+                noise=action_noise,
+                batch_size=total_samples,
+                step_fn=step_fn,
+                device=device,
+                return_all_steps=False,
+                **sample_kwargs,
+            )
 
         action_noise.normal_()
 
@@ -191,7 +183,7 @@ class FlashDriveBaseMixin:
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
             },
-            make_fn,
+            action_fn,
         )
 
     # =========================== Shared action tail ===========================
@@ -272,14 +264,12 @@ class FlashDriveBaseMixin:
         """Run the fully-optimized FlashDrive rollout on one window.
 
         Streaming prefill + DFlash speculative decode + action-expert diffusion.
-        ``temperature`` / ``top_p`` drive the CoT decoding (temperature 0 = greedy);
-        the defaults match the stock baseline's sampled decoding. The first call per
-        stream only prefills the KV cache and returns ``(None, None)`` (plus ``None``
-        extra when ``return_extra``). The first call also fixes the stream's shape
-        budget — ``max_new_tokens`` and ``num_traj_samples * num_traj_sets`` size the
-        static KV cache and the compiled cudagraph shapes, so later windows must not
-        exceed them; ``temperature`` / ``top_p`` are likewise bound into the decode
-        graph by the first decoded window.
+        The first call per stream only prefills the KV cache and returns
+        ``(None, None)``; it also fixes the stream's budget — ``max_new_tokens``
+        and the sample counts size the static cache and cudagraph shapes, and
+        ``temperature`` / ``top_p`` (defaults match the original model's sampled
+        decoding; 0 = greedy) are bound into the decode graph — so later windows
+        must not change them.
         """
         tokenized = data["tokenized_data"]
         input_ids = tokenized["input_ids"]
@@ -291,7 +281,8 @@ class FlashDriveBaseMixin:
 
         batch_size, num_traj_groups, _, _ = ego_history_xyz.shape
         num_samples = num_traj_samples * num_traj_sets
-        assert num_traj_groups == 1, "Only one trajectory group is supported."
+        if num_traj_groups != 1:
+            raise ValueError(f"Only one trajectory group is supported, got {num_traj_groups}.")
 
         input_ids = self.fuse_traj_tokens(
             input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
@@ -299,7 +290,6 @@ class FlashDriveBaseMixin:
 
         # ---- first window: size + allocate the stream state, prefill KV, bail out ----
         if self._past_key_values is None:
-            logger.info("Streaming: First prefill - caching KV, position_ids, and attention_mask.")
             self.prefill_seq_length = input_ids.shape[1]
             self.max_cache_len = (
                 self.prefill_seq_length
@@ -319,7 +309,6 @@ class FlashDriveBaseMixin:
         # ---- streaming prefill inputs (drop everything before the first frame) ----
         first_vision_start = torch.where(input_ids == self.vision_start_token_id)[1][0].item()
         input_ids = input_ids[:, first_vision_start:]
-        cache_position = self.streaming_cache_position
         window_seq_length = input_ids.shape[1]
         image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
         inputs_embeds, image_mask = self._embed_tokens_with_images(input_ids, image_embeds)
@@ -332,7 +321,7 @@ class FlashDriveBaseMixin:
             deepstack_image_embeds=deepstack_image_embeds,
             position_ids=self.streaming_position_ids,
             streaming_attention_mask=self._ensure_streaming_attention_mask(),
-            cache_position=cache_position,
+            cache_position=self.streaming_cache_position,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,

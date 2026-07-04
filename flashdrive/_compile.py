@@ -1,13 +1,12 @@
 """torch.compile + cudagraph machinery for FlashDrive.
 
-`TorchCompileMixin` is infrastructure, not a feature: its setup takes a mode,
-not a checkpoint. It owns the buffer-backed compiled-primitive driver that every
-hot-path forward runs through (``_encode`` / ``_action`` on the base, the DFlash
-prefill / block-step / text-forward steps). Compilation is lazy — one cudagraph per
-primitive and input shape — under the mode fixed at load time by
-:meth:`TorchCompileMixin.setup_torch_compile`.
+`TorchCompileMixin` owns the buffer-backed compiled-primitive driver behind every
+hot-path forward (``_encode`` / ``_action``, the DFlash prefill / block-step /
+traj-forward steps). Compilation is lazy — one cudagraph per primitive — under
+the mode fixed at load time by ``setup_torch_compile``.
 """
 
+import functools
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -17,10 +16,11 @@ import torch
 
 @dataclass
 class _CompiledStep:
-    """One buffer-backed primitive: persistent input buffers + its closure.
+    """One buffer-backed primitive: persistent input buffers + the step bound to them.
 
-    ``compiled`` starts as None and is filled on first dispatch under a compile
-    mode (after one eager warmup call).
+    ``fn`` is argument-free (the primitive bound to its buffers); ``compiled``
+    starts as None and is filled on first dispatch under a compile mode (after
+    one eager warmup call).
     """
 
     buffers: dict[str, Any]
@@ -35,10 +35,8 @@ class TorchCompileMixin:
         """Fix the ``torch.compile`` mode for the rollout's compiled primitives.
 
         ``mode`` is a ``torch.compile`` mode string (e.g. ``"max-autotune"``) or
-        ``None`` to run everything eagerly. This is load-time configuration, not
-        a per-call knob: primitives compile lazily on first use and cache their
-        compiled form. Initializes the mixin's whole state — rerunning it resets
-        the primitive registry, and no primitive may run before it.
+        ``None`` for eager. Also initializes the primitive registry, so it must
+        run before any primitive (and rerunning it resets them all).
         """
         self._torch_compile = mode
         self._compiled_step_registry: dict[str, _CompiledStep] = {}
@@ -47,21 +45,19 @@ class TorchCompileMixin:
         self,
         key: str,
         tensors: dict[str, Any],
-        make_fn: Callable[[dict[str, Any]], Callable[[], Any]],
+        fn: Callable[[dict[str, Any]], Any],
     ) -> Any:
-        """Run one buffer-backed compiled primitive.
+        """Run one buffer-backed compiled primitive: ``fn(buffers)``.
 
-        On first call (per ``key``) it allocates persistent input buffers shaped
-        like ``tensors``, builds the closure once via ``make_fn(buffers)``, and
-        registers both. Every call then copies the current inputs into those
-        buffers and runs the closure — eagerly when compilation is disabled
-        (``_torch_compile is None``), otherwise via its lazily compiled form
-        inside a fresh cudagraph step. Keying by ``key`` gives one cudagraph per
-        input shape.
+        The first call per ``key`` allocates persistent input buffers shaped like
+        ``tensors`` and binds ``fn`` to them; later calls reuse that binding (their
+        ``fn`` is ignored, so whatever ``fn`` closes over is fixed by the first
+        call). Every call copies the current inputs into the buffers and runs the
+        bound step — eager when ``_torch_compile`` is None, otherwise lazily
+        compiled into one cudagraph per key.
 
-        ``tensors`` values may be a Tensor, a list/tuple of Tensors (e.g. deepstack
-        embeds), or ``None`` (an absent optional input); ``buffers`` mirrors that
-        structure so the closure can index it by name.
+        ``tensors`` values may be a Tensor, a list/tuple of Tensors, or ``None``
+        (an absent optional input); ``buffers`` mirrors that structure.
         """
         step = self._compiled_step_registry.get(key)
         if step is None:
@@ -73,7 +69,7 @@ class TorchCompileMixin:
                     buffers[name] = [torch.empty_like(e) for e in t]
                 else:
                     buffers[name] = torch.empty_like(t)
-            step = _CompiledStep(buffers=buffers, fn=make_fn(buffers))
+            step = _CompiledStep(buffers=buffers, fn=functools.partial(fn, buffers))
             self._compiled_step_registry[key] = step
 
         for name, t in tensors.items():
@@ -81,7 +77,7 @@ class TorchCompileMixin:
                 continue
             buf = step.buffers[name]
             if isinstance(buf, list):
-                for b, e in zip(buf, t):
+                for b, e in zip(buf, t, strict=True):
                     b.copy_(e)
             else:
                 buf.copy_(t)
