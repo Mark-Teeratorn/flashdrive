@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Environments
+.venv/
+
+# Tool caches
+.ruff_cache/
+
+# Editor
+*.swp
+
+# Local Slurm / benchmarking scratch (not part of the repo)
+slurm-*.out
+*.sbatch
+scratch/

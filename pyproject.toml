@@ -1,0 +1,51 @@
+[project]
+name = "flashdrive"
+version = "0.1.0"
+description = "FlashDrive: an inference-only acceleration patch (streaming, DFlash speculative decoding, W4A8/PARO quantization) applied on top of the external Alpamayo VLA models."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Z Lab" }]
+requires-python = "==3.12.*"
+dependencies = [
+  # External Alpamayo model packages that FlashDrive patches at runtime.
+  "alpamayo1_5 @ git+https://github.com/NVlabs/alpamayo1.5",
+  "alpamayo_r1 @ git+https://github.com/NVlabs/alpamayo",
+  # Runtime deps used directly by the patch code.
+  "einops>=0.8.1",
+  "numpy>=2.2.0",
+  "torch==2.9.1",
+  "torchvision>=0.24.0",
+  "transformers==4.57.1",
+  "vllm==0.16.0",
+  "hf_transfer==0.1.9",
+  # Rotation CUDA kernel for W4A8 (registers torch.ops.rotation.rotate, JIT-built
+  # on first use). Pure-Python wheel, so it installs via uv sync.
+  "paroquant==0.1.15",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["flashdrive*"]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.9.0",
+]
+
+[tool.uv]
+# The external Alpamayo packages pin torch==2.8.0; override so the project's
+# torch==2.9.1 wins and `uv lock`/`uv sync` resolve cleanly. Targets CUDA 12.8.
+override-dependencies = ["torch==2.9.1"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# pyflakes (F) + import sorting (I) + default pycodestyle (E4/E7/E9).
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.format]
+# Defaults: double quotes, line-length from [tool.ruff].
