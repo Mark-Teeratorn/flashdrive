@@ -16,17 +16,16 @@
 
 ## Performance
 
-Measured with `scripts/infer.py` on a single RTX PRO 6000 over a full PhysicalAI-AV
-clip (117 windows, one trajectory sample per step). minADE improves on both models.
+Measured with `scripts/infer.py` on a single RTX PRO 6000 over 100 PhysicalAI-AV
+clips (100 windows each, one trajectory sample per step). minADE improves on both
+models.
 
-| Model | minADE ↓ | Latency (median / window) | Speedup |
+| Model | minADE ↓ | Latency (mean / window) | Speedup |
 |---|---|---|---|
-| Alpamayo 1.5 | 2.144 | 813 ms | 1.0× |
-| Alpamayo 1.5 + **FlashDrive** | **1.864** | **198 ms** | **4.1×** |
-| Alpamayo 1 (R1) | 2.002 | 796 ms | 1.0× |
-| Alpamayo 1 (R1) + **FlashDrive** | **1.994** | **206 ms** | **3.9×** |
-
-On other consumer-grade GPU devices, FlashDrive reaches speedups of up to 5.7×.
+| Alpamayo 1.5 | 1.720 | 836 ms | 1.0× |
+| Alpamayo 1.5 + **FlashDrive** | **1.577** | **206 ms** | **4.1×** |
+| Alpamayo 1 (R1) | 1.838 | 826 ms | 1.0× |
+| Alpamayo 1 (R1) + **FlashDrive** | **1.662** | **194 ms** | **4.3×** |
 
 ## Quick Start
 
