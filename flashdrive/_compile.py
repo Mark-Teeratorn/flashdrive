@@ -41,6 +41,10 @@ class TorchCompileMixin:
         self._torch_compile = mode
         self._compiled_step_registry: dict[str, _CompiledStep] = {}
 
+    def has_compiled_step(self, key: str) -> bool:
+        """True once a primitive has run (and therefore compiled, if enabled)."""
+        return key in self._compiled_step_registry
+
     def _compiled_step(
         self,
         key: str,

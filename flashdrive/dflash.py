@@ -353,7 +353,11 @@ class DFlashMixin:
         position_ids: torch.Tensor,
         cache_position: torch.Tensor,
     ) -> None:
-        """Run the 1-token trajectory-start step through the target, for its KV only."""
+        """Run the 1-token trajectory-start step through the target, for its KV only.
+
+        Fires only when the verify missed the traj-KV piggyback; the driver warms
+        it in the first window so its compile never lands mid-stream.
+        """
 
         def traj_forward_fn(b: dict[str, Any]) -> torch.Tensor:
             return self.vlm.model.language_model(
@@ -598,11 +602,19 @@ class DFlashMixin:
         )
         dflash_output_ids[:, :num_input_tokens] = self.tokenizer.pad_token_id
 
-        # Forbid <cot_end> as the first generated token: a zero-token CoC is never
-        # valid, and greedy decoding otherwise collapses to one on Alpamayo R1.
-        first_logits = logits.unsqueeze(1)
-        first_logits[:, :, self._dflash_stop_token_id] = float("-inf")
-        first_token = sample_tokens(first_logits, self._dflash_traj_mask, temperature, top_p)
+        traj_start_token = torch.tensor([[self.traj_start_token_id]], device=device)
+        if not self.has_compiled_step("dflash_traj_forward"):
+            # Compile the conditionally-fired traj forward with the rest of this
+            # first window's graphs; its first fire must never compile mid-stream.
+            # Writes the first decode slot, which the verify below overwrites. Clone
+            # the prefill's live graph outputs first: running another graph would
+            # invalidate them.
+            logits, target_hidden = logits.clone(), target_hidden.clone()
+            self._dflash_traj_forward(
+                traj_start_token, position_ids, torch.tensor([num_input_tokens], device=device)
+            )
+
+        first_token = sample_tokens(logits.unsqueeze(1), self._dflash_traj_mask, temperature, top_p)
         dflash_output_ids[:, num_input_tokens : num_input_tokens + 1] = first_token
 
         dflash_output_ids, current_seq_len, traj_cached = self._dflash_decode_loop(
@@ -615,7 +627,6 @@ class DFlashMixin:
             top_p=top_p,
         )
 
-        traj_start_token = torch.tensor([[self.traj_start_token_id]], device=device)
         if not traj_cached:
             # Feed the trajectory-start token through the target so its KV is cached
             # before the action expert runs.

@@ -6,7 +6,7 @@
 [![Blog](https://img.shields.io/badge/Blog-FlashDrive-blue)](https://z-lab.ai/projects/flashdrive/)
 [![Models](https://img.shields.io/badge/%F0%9F%A4%97-Models-yellow)](https://huggingface.co/collections/z-lab/flashdrive)
 
-**FlashDrive** accelerates [Alpamayo 1.5](https://huggingface.co/nvidia/Alpamayo-1.5-10B) and [Alpamayo 1](https://huggingface.co/nvidia/Alpamayo-R1-10B) — NVIDIA's 10B-parameter vision-language-action models for autonomous driving — by **4.1× with no loss in accuracy**, through algorithm-system co-design of five techniques, none sufficient alone:
+**FlashDrive** accelerates [Alpamayo 1.5](https://huggingface.co/nvidia/Alpamayo-1.5-10B) and [Alpamayo 1](https://huggingface.co/nvidia/Alpamayo-R1-10B) — NVIDIA's 10B-parameter vision-language-action models for autonomous driving — by **4.5× with no loss in accuracy**, through algorithm-system co-design of five techniques, none sufficient alone:
 
 - **Streaming inference** — reuse each frame's KV cache across windows, so a new window only prefills its latest frames.
 - **Speculative reasoning** ([DFlash](https://github.com/z-lab/dflash)) — a block-diffusion draft proposes 8-token blocks that the target verifies in one forward, preserving its output distribution.
@@ -17,15 +17,23 @@
 ## Performance
 
 Measured with `scripts/infer.py` on a single RTX PRO 6000 over 100 PhysicalAI-AV
-clips (100 windows each, one trajectory sample per step). minADE improves on both
-models.
+clips (one trajectory sample per step). minADE improves on both models.
 
-| Model | minADE ↓ | Latency (mean / window) | Speedup |
+| Model | minADE ↓ | Latency (per window) | Speedup |
 |---|---|---|---|
-| Alpamayo 1.5 | 1.720 | 836 ms | 1.0× |
-| Alpamayo 1.5 + **FlashDrive** | **1.577** | **206 ms** | **4.1×** |
-| Alpamayo 1 (R1) | 1.838 | 826 ms | 1.0× |
-| Alpamayo 1 (R1) + **FlashDrive** | **1.662** | **194 ms** | **4.3×** |
+| Alpamayo 1.5 | 1.705 | 717 ms | 1.0× |
+| Alpamayo 1.5 + **FlashDrive** | **1.573** | **151 ms** | **4.7×** |
+| Alpamayo 1 (R1) | 1.869 | 704 ms | 1.0× |
+| Alpamayo 1 (R1) + **FlashDrive** | **1.662** | **155 ms** | **4.5×** |
+
+Every stage of the rollout is accelerated (baseline → FlashDrive, ms):
+
+| Stage | Alpamayo 1.5 | Alpamayo 1 (R1) |
+|---|---|---|
+| Encode | 87.0 → **12.0** (7.3×) | 86.4 → **12.0** (7.2×) |
+| Prefill | 165.3 → **47.2** (3.5×) | 162.3 → **46.9** (3.5×) |
+| Decode | 271.7 → **45.3** (6.0×) | 262.5 → **49.6** (5.3×) |
+| Action | 192.9 → **46.9** (4.1×) | 192.6 → **46.9** (4.1×) |
 
 ## Quick Start
 
