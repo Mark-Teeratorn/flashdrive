@@ -2,7 +2,7 @@
 
 **Flash Vision-Language-Action Inference for Autonomous Driving**
 
-![Paper](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg)
+[![Paper](https://img.shields.io/badge/arXiv-2608.12932-b31b1b.svg)](https://arxiv.org/abs/2608.12932)
 [![Blog](https://img.shields.io/badge/Blog-FlashDrive-blue)](https://z-lab.ai/projects/flashdrive/)
 [![Models](https://img.shields.io/badge/%F0%9F%A4%97-Models-yellow)](https://huggingface.co/collections/z-lab/flashdrive)
 
@@ -93,10 +93,12 @@ mirror NVIDIA's release and remain under its
 ## Citation
 
 ```bibtex
-@article{li2026flashdrive,
-  title  = {{FlashDrive: Flash Vision-Language-Action Inference for Autonomous Driving}},
-  author = {Li, Zekai and Liang, Yihao and Zhang, Hongfei and Chen, Jian and Liang, Yesheng and Liu, Zhijian},
-  year   = {2026}
+@inproceedings{li2026flashdrive,
+  title     = {{FlashDrive: Flash Vision-Language-Action Inference for Autonomous Driving}},
+  author    = {Li, Zekai and Liang, Yihao and Zhang, Hongfei and Chen, Jian and Liang, Yesheng and Liu, Zhijian},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2608.12932}
 }
 ```
 
@@ -117,3 +119,4 @@ FlashDrive builds on DFlash and ParoQuant; please consider citing them as well:
   year      = {2026}
 }
 ```
+
