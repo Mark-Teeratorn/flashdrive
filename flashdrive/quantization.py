@@ -190,6 +190,11 @@ class ParoQuantMixin:
                 quantized = RotateLinearW4A8(linear.in_features, linear.out_features)
                 setattr(parent, name, BF16RotateLinearWrapper(quantized))
 
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         checkpoint_dir = Path(checkpoint_path)
         if not checkpoint_dir.is_dir():
             from huggingface_hub import snapshot_download
@@ -211,6 +216,9 @@ class ParoQuantMixin:
         if unexpected:
             logger.warning("Unexpected %d keys: %s", len(unexpected), unexpected[:5])
         del state_dict
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # The surgery builds its modules on CPU and the checkpoint loads CPU tensors;
         # bring the quantized language model to the model's device.

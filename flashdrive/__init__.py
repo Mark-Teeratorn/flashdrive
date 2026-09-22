@@ -118,6 +118,9 @@ def from_pretrained(
     model.setup_paroquant(f"{model_path}-PARO")
     model.setup_expert_fusion()
     model.setup_dflash(f"{model_path}-DFlash")
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     return model
 
 
