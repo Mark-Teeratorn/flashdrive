@@ -260,12 +260,35 @@ class FlashDriveEngine:
             # Prefill phase
             return {"status": "prefill", "pred_xyz": None, "latency_ms": elapsed_ms}
 
-        cot = extra.get("cot", [""])[0] if "cot" in extra else ""
+        cot = ""
+        meta_action = ""
+        if extra:
+            if "cot" in extra:
+                c = extra["cot"]
+                if isinstance(c, np.ndarray):
+                    cot = str(c.flat[0]) if c.size > 0 else ""
+                elif isinstance(c, (list, tuple)) and len(c) > 0:
+                    cot = str(c[0])
+                else:
+                    cot = str(c)
+            if "meta_action" in extra:
+                m = extra["meta_action"]
+                if isinstance(m, np.ndarray):
+                    meta_action = str(m.flat[0]) if m.size > 0 else ""
+                elif isinstance(m, (list, tuple)) and len(m) > 0:
+                    meta_action = str(m[0])
+                else:
+                    meta_action = str(m)
+
+        if cot:
+            logger.info(f"[step {self.step_idx}] latency={elapsed_ms:.1f}ms | CoC: {cot!r}")
+
         return {
             "status": "ok",
             "pred_xyz": pred_xyz.cpu().numpy(),
             "pred_rot": pred_rot.cpu().numpy() if pred_rot is not None else None,
-            "cot": str(cot),
+            "cot": cot,
+            "meta_action": meta_action,
             "latency_ms": elapsed_ms,
         }
 
