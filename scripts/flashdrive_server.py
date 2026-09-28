@@ -125,6 +125,7 @@ class FlashDriveEngine:
         logger.info(f"Base model loaded. Optimized FlashDrive: {self.optimized}")
 
         if expert_ckpt:
+            import gc
             import glob
             from safetensors.torch import load_file
             logger.info(f"Extracting fine-tuned Action Expert weights from {expert_ckpt}...")
@@ -136,12 +137,18 @@ class FlashDriveEngine:
                 shard = load_file(filepath, device="cpu")
                 for key, tensor in shard.items():
                     if any(module in key for module in ["action", "expert", "diffusion", "delta"]):
-                        expert_weights[key] = tensor.to(device=self.device, dtype=torch.bfloat16)
+                        expert_weights[key] = tensor.to(dtype=torch.bfloat16)
+                del shard
 
             missing, unexpected = self.model.load_state_dict(expert_weights, strict=False)
+            num_tensors = len(expert_weights)
+            del expert_weights
+            gc.collect()
+            torch.cuda.empty_cache()
+
             mem_gb = torch.cuda.memory_allocated() / (1024**3)
             logger.info(
-                f"[Option C] Successfully patched {len(expert_weights)} fine-tuned expert tensors into base model! "
+                f"[Option C] Successfully patched {num_tensors} fine-tuned expert tensors into base model! "
                 f"Total VRAM allocated: {mem_gb:.2f} GB (Leaving plenty of headroom for CARLA)."
             )
 
@@ -379,8 +386,12 @@ def serve(args: argparse.Namespace) -> None:
                     elif cmd == "ping":
                         send_msg(client_sock, {"status": "pong"})
                     elif cmd == "step":
-                        res = engine.step(req)
-                        send_msg(client_sock, res)
+                        try:
+                            res = engine.step(req)
+                            send_msg(client_sock, res)
+                        except Exception as e:
+                            logger.exception(f"Error during step inference: {e}")
+                            send_msg(client_sock, {"status": "error", "message": str(e)})
                     else:
                         send_msg(client_sock, {"status": "error", "message": f"Unknown cmd: {cmd}"})
             except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
