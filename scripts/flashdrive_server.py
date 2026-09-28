@@ -127,18 +127,41 @@ class FlashDriveEngine:
         if expert_ckpt:
             import gc
             import glob
-            from safetensors.torch import load_file
-            logger.info(f"Extracting fine-tuned Action Expert weights from {expert_ckpt}...")
-            safetensor_files = sorted(glob.glob(f"{expert_ckpt}/*.safetensors"))
-            if not safetensor_files:
-                raise FileNotFoundError(f"No .safetensors files found in {expert_ckpt}")
-            expert_weights = {}
-            for filepath in safetensor_files:
-                shard = load_file(filepath, device="cpu")
-                for key, tensor in shard.items():
-                    if any(module in key for module in ["action", "expert", "diffusion", "delta"]):
-                        expert_weights[key] = tensor.to(dtype=torch.bfloat16)
-                del shard
+            from pathlib import Path
+            from safetensors.torch import load_file, save_file
+
+            expert_path = Path(expert_ckpt).resolve()
+            if expert_path.is_file() and expert_path.suffix == ".safetensors":
+                cached_file = expert_path
+            else:
+                cached_file = expert_path / "action_expert.safetensors"
+
+            if cached_file.exists():
+                logger.info(f"Loading cached Action Expert directly from: {cached_file} ...")
+                t0 = time.perf_counter()
+                expert_weights = load_file(str(cached_file), device="cpu")
+                logger.info(f"Loaded {len(expert_weights)} expert tensors from cache in {time.perf_counter() - t0:.2f}s!")
+            else:
+                logger.info(f"Extracting fine-tuned Action Expert weights from shards in {expert_path}...")
+                safetensor_files = sorted(glob.glob(f"{expert_path}/*.safetensors"))
+                safetensor_files = [f for f in safetensor_files if not f.endswith("action_expert.safetensors")]
+                if not safetensor_files:
+                    raise FileNotFoundError(f"No .safetensors shards found in {expert_path}")
+                expert_weights = {}
+                for filepath in safetensor_files:
+                    shard = load_file(filepath, device="cpu")
+                    for key, tensor in shard.items():
+                        if any(module in key for module in ["action", "expert", "diffusion", "delta"]):
+                            expert_weights[key] = tensor.to(dtype=torch.bfloat16)
+                    del shard
+
+                # Auto-save cache so all subsequent runs load in 1-2 seconds!
+                try:
+                    logger.info(f"Auto-saving cached Action Expert to {cached_file} for instant future runs...")
+                    save_file(expert_weights, str(cached_file))
+                    logger.info(f"Saved {cached_file.name} ({cached_file.stat().st_size / (1024**3):.2f} GB).")
+                except Exception as save_err:
+                    logger.warning(f"Could not auto-save action_expert.safetensors: {save_err}")
 
             missing, unexpected = self.model.load_state_dict(expert_weights, strict=False)
             num_tensors = len(expert_weights)
