@@ -186,12 +186,16 @@ class FlashDriveEngine:
         logger.info(f"[step {self.step_idx}] camera_indices={camera_indices.tolist()}, "
                      f"num_frames_per_camera={num_frames_per_camera}, nav_text={nav_text!r}")
 
-        messages = self.helper.create_message(
-            images,
-            nav_text=nav_text,
-            num_frames_per_camera=num_frames_per_camera,
-            **camera_kwargs,
-        )
+        create_msg_params = inspect.signature(self.helper.create_message).parameters
+        create_kwargs = {}
+        if "nav_text" in create_msg_params:
+            create_kwargs["nav_text"] = nav_text
+        if "num_frames_per_camera" in create_msg_params:
+            create_kwargs["num_frames_per_camera"] = num_frames_per_camera
+        if "camera_indices" in create_msg_params:
+            create_kwargs["camera_indices"] = camera_indices
+
+        messages = self.helper.create_message(images, **create_kwargs)
 
         inputs = self.processor.apply_chat_template(
             messages,
