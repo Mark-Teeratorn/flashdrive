@@ -23,6 +23,11 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+# Force offline mode for Hugging Face Hub so models resolve instantly from local cache without network timeouts
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+
 # Auto-configure CUDA_HOME and CPATH for torch JIT extensions to find nvidia CUDA headers (e.g. cusolverDn.h)
 if "CUDA_HOME" not in os.environ and os.path.exists("/usr/local/cuda"):
     os.environ["CUDA_HOME"] = "/usr/local/cuda"
