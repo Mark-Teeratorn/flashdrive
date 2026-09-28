@@ -88,6 +88,7 @@ class FlashDriveEngine:
         dummy: bool = False,
         num_samples: int = 1,
         torch_compile: str | None = None,
+        expert_checkpoint: str | None = None,
     ):
         self.model_path = model_path
         self.device = device
@@ -105,13 +106,47 @@ class FlashDriveEngine:
         self.flashdrive = flashdrive
         self.convert_to_streaming_window = convert_to_streaming_window
 
-        logger.info(f"Loading Alpamayo model from {model_path} onto {device} (torch_compile={torch_compile})...")
-        self.model = flashdrive.from_pretrained(model_path, device=device, torch_compile=torch_compile)
+        # FlashDrive Option C: If a custom/local checkpoint is provided, load the
+        # 4-bit PARO quantized base model (~11 GB VRAM) and patch the trained
+        # Action Expert weights (416 tensors) into it.
+        expert_ckpt = expert_checkpoint
+        load_path = model_path
+        if expert_ckpt is None and not model_path.lower().startswith("z-lab/"):
+            expert_ckpt = model_path
+            load_path = "z-lab/Alpamayo-1.5-10B"
+            logger.info(
+                f"[Option C] Detected local fine-tuned checkpoint: {expert_ckpt}. "
+                f"Loading optimized 4-bit base model '{load_path}' and patching Action Expert."
+            )
+
+        logger.info(f"Loading Alpamayo model from {load_path} onto {device} (torch_compile={torch_compile})...")
+        self.model = flashdrive.from_pretrained(load_path, device=device, torch_compile=torch_compile)
         self.optimized = isinstance(self.model, flashdrive.FlashDriveMixin)
-        logger.info(f"Model loaded. Optimized FlashDrive: {self.optimized}")
+        logger.info(f"Base model loaded. Optimized FlashDrive: {self.optimized}")
+
+        if expert_ckpt:
+            import glob
+            from safetensors.torch import load_file
+            logger.info(f"Extracting fine-tuned Action Expert weights from {expert_ckpt}...")
+            safetensor_files = sorted(glob.glob(f"{expert_ckpt}/*.safetensors"))
+            if not safetensor_files:
+                raise FileNotFoundError(f"No .safetensors files found in {expert_ckpt}")
+            expert_weights = {}
+            for filepath in safetensor_files:
+                shard = load_file(filepath, device="cpu")
+                for key, tensor in shard.items():
+                    if any(module in key for module in ["action", "expert", "diffusion", "delta"]):
+                        expert_weights[key] = tensor.to(device=self.device, dtype=torch.bfloat16)
+
+            missing, unexpected = self.model.load_state_dict(expert_weights, strict=False)
+            mem_gb = torch.cuda.memory_allocated() / (1024**3)
+            logger.info(
+                f"[Option C] Successfully patched {len(expert_weights)} fine-tuned expert tensors into base model! "
+                f"Total VRAM allocated: {mem_gb:.2f} GB (Leaving plenty of headroom for CARLA)."
+            )
 
         # Resolve helper package
-        package = flashdrive.resolve_model_class(model_path).__module__.split(".")[0]
+        package = flashdrive.resolve_model_class(load_path).__module__.split(".")[0]
         self.helper = importlib.import_module(f"{package}.helper")
         self.camera_conditioned = "camera_indices" in inspect.signature(self.helper.create_message).parameters
         self.processor = self.helper.get_processor(self.model.tokenizer)
@@ -304,6 +339,7 @@ def serve(args: argparse.Namespace) -> None:
         dummy=args.dummy,
         num_samples=args.num_traj_samples,
         torch_compile=args.torch_compile,
+        expert_checkpoint=getattr(args, "expert_checkpoint", None),
     )
 
     use_unix = args.use_unix
@@ -360,6 +396,7 @@ def serve(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="FlashDrive Alpamayo-1.5 Server")
     parser.add_argument("--model-path", default="z-lab/Alpamayo-1.5-10B", help="Model checkpoint path")
+    parser.add_argument("--expert-checkpoint", default=None, help="Path to fine-tuned checkpoint to patch Action Expert")
     parser.add_argument("--device", default="cuda", help="Inference device")
     parser.add_argument("--host", default="127.0.0.1", help="TCP host")
     parser.add_argument("--port", type=int, default=DEFAULT_TCP_PORT, help="TCP port")
