@@ -84,6 +84,34 @@ All checkpoints are on the [Hugging Face collection](https://huggingface.co/coll
 | Alpamayo 1.5 | [z-lab/Alpamayo-1.5-10B](https://huggingface.co/z-lab/Alpamayo-1.5-10B) | [-PARO](https://huggingface.co/z-lab/Alpamayo-1.5-10B-PARO) | [-DFlash](https://huggingface.co/z-lab/Alpamayo-1.5-10B-DFlash) |
 | Alpamayo 1 (R1) | [z-lab/Alpamayo-R1-10B](https://huggingface.co/z-lab/Alpamayo-R1-10B) | [-PARO](https://huggingface.co/z-lab/Alpamayo-R1-10B-PARO) | [-DFlash](https://huggingface.co/z-lab/Alpamayo-R1-10B-DFlash) |
 
+## Autonomous Driving Model Server (LEAD / CARLA Integration)
+
+FlashDrive includes an ultra-low latency IPC model server for closed-loop evaluation in simulators such as CARLA 0.9.15/0.9.16 via the **LEAD** framework.
+
+### 1. Extracting Fine-Tuned Action Expert Weights
+When fine-tuning on custom datasets (e.g. curated routes), only the Action Expert weights are updated. To avoid storing and loading full 21 GB sharded checkpoints, use our extractor:
+
+```bash
+python scripts/extract_action_expert.py \
+    --checkpoint /path/to/checkpoint-XXXX \
+    --output-dir checkpoints/action_experts/checkpoint-XXXX
+```
+This extracts the 416 diffusion and projection tensors into a standalone `action_expert.safetensors` (~4.25 GB).
+
+### 2. Starting the FlashDrive Server
+Launch the server listening on a UNIX domain socket (zero network latency):
+
+```bash
+python scripts/flashdrive_server.py \
+    --model-path checkpoints/action_experts/checkpoint-6400 \
+    --socket-path /tmp/alpamayo_flashdrive.sock
+```
+
+The server automatically loads the W4A8 quantized 10B base model (~11.9 GB VRAM) and patches the fine-tuned action expert on the fly, leaving over 12 GB of VRAM headroom for the simulator on consumer GPUs like the RTX 4090.
+
+> [!TIP]
+> For complete instructions on transferring and deploying FlashDrive to a new server or cloud VM, see [TRANSFER_GUIDE.md](TRANSFER_GUIDE.md).
+
 ## License
 
 FlashDrive's code is released under the [MIT License](LICENSE). The Alpamayo weights
